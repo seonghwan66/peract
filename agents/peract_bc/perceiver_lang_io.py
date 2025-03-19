@@ -89,7 +89,6 @@ class FeedForward(nn.Module):
     def forward(self, x):
         return self.net(x)
 
-
 class Attention(nn.Module):
     def __init__(self, query_dim, context_dim=None, heads=8, dim_head=64, dropout=0.0):
         super().__init__()
@@ -131,6 +130,64 @@ class Attention(nn.Module):
         out = rearrange(out, '(b h) n d -> b n (h d)', h=h)
         return self.to_out(out)
 
+#------------------------------------------------------------------------------------------------------------------
+# 1. 메모리 슬롯 구조 구현
+class MemorySlots:
+    def __init__(self, dim):
+        self.num_slots = 100000  # 메모리 슬롯의 최대 크기 100,000으로 설정
+        self.keys = torch.zeros(self.num_slots, dim)  # Key를 2D로 초기화
+        self.values = torch.zeros(self.num_slots, dim)  # Value를 2D로 초기화
+        self.current_slot = 0  # 현재 메모리에 저장할 슬롯 인덱스
+        self.filled_slots = 0  # 실제 저장된 슬롯의 개수 (0에서 num_slots까지 증가)
+
+
+    # MIPS 기법을 사용해 쿼리를 기반으로 메모리 슬롯에서 검색
+    def retrieve(self, query):
+        similarities = torch.matmul(query, self.keys.T)  # 쿼리와 키 사이의 내적 계산
+        best_match_idx = torch.argmax(similarities, dim=-1)  # 가장 유사한 슬롯 선택
+        return self.values[best_match_idx]  # 선택된 Value 반환
+
+    # 새로운 학습 결과를 메모리 슬롯에 저장
+    def store(self, new_key, new_value):
+        # new_key와 new_value의 차원을 1D로 변환하고 512 차원으로 축소
+        new_key = new_key.flatten()  # 1033856 크기의 1D 벡터로 변환
+        new_value = new_value.flatten()  # 1033856 크기의 1D 벡터로 변환
+        
+        # adaptive_avg_pool1d를 사용하여 512차원으로 축소
+        new_key = F.adaptive_avg_pool1d(new_key.unsqueeze(0), 512).squeeze(0)
+        new_value = F.adaptive_avg_pool1d(new_value.unsqueeze(0), 512).squeeze(0)
+        
+        # 현재 슬롯에 저장
+        self.keys[self.current_slot] = new_key
+        self.values[self.current_slot] = new_value
+
+        # 다음 슬롯으로 이동, 만약 슬롯이 가득 찼으면 처음부터 다시 덮어씌움 (순환 구조)
+        self.current_slot = (self.current_slot + 1) % self.num_slots
+        if self.filled_slots < self.num_slots:
+	          self.filled_slots += 1  # 저장된 슬롯 개수 증가
+
+# 2. Cross Attention에서 메모리 결합
+class CrossAttentionWithMemory(nn.Module):
+    def __init__(self, query_dim, context_dim, memory_slots, heads=8, dim_head=64, dropout=0.0):
+        super().__init__()
+        self.attn = nn.MultiheadAttention(query_dim, heads)
+        self.memory_slots = memory_slots  # 메모리 슬롯 연결
+        self.to_q = nn.Linear(query_dim, heads * dim_head, bias=False)
+        self.to_kv = nn.Linear(context_dim, heads * dim_head * 2, bias=False)
+
+    def forward(self, query, context=None):
+        if self.memory_slots.filled_slots >= self.memory_slots.num_slots: # memory slots이 가득 찼을 때만 실행
+            memory_value = self.memory_slots.retrieve(query)  # 메모리에서 검색된 값 / dim -> 1xdim
+            augmented_context = torch.cat([context, memory_value], dim=-1)  # 메모리 값을 결합
+        else:
+            augmented_context = context # context=None으로 설정되어있어 memory slots이 가득 차지 않으면 아무런 영향 없음.
+        
+        q = self.to_q(query)
+        k, v = self.to_kv(augmented_context).chunk(2, dim=-1)
+        out, _ = self.attn(q, k, v)
+        return out
+#------------------------------------------------------------------------------------------------------------------
+
 
 # PerceiverIO adapted for 6-DoF manipulation
 class PerceiverVoxelLangEncoder(nn.Module):
@@ -166,6 +223,7 @@ class PerceiverVoxelLangEncoder(nn.Module):
             no_perceiver=False,
             no_language=False,
             final_dim=64,
+            memory_slots=None
     ):
         super().__init__()
         self.depth = depth
@@ -190,6 +248,7 @@ class PerceiverVoxelLangEncoder(nn.Module):
         self.no_skip_connection = no_skip_connection
         self.no_perceiver = no_perceiver
         self.no_language = no_language
+        self.memory_slots = MemorySlots(latent_dim)
 
         # patchified input dimensions
         spatial_size = voxel_size // self.voxel_patch_stride  # 100/5 = 20
@@ -416,11 +475,11 @@ class PerceiverVoxelLangEncoder(nn.Module):
         # batchify latents
         x = repeat(self.latents, 'n d -> b n d', b=b)
 
-        cross_attn, cross_ff = self.cross_attend_blocks
+        cross_attn_with_memory, cross_ff = self.cross_attend_blocks
 
         for it in range(self.iterations):
             # encoder cross attention
-            x = cross_attn(x, context=ins, mask=mask) + x
+            x = cross_attn_with_memory(x, context=ins, mask=mask) + x
             x = cross_ff(x) + x
 
             # self-attention layers
@@ -430,6 +489,11 @@ class PerceiverVoxelLangEncoder(nn.Module):
 
         # decoder cross attention
         latents = self.decoder_cross_attn(ins, context=x)
+        
+        # 메모리 업데이트 (Decoder Cross Attention 직후)
+        new_key = latents.detach()  # Latents 출력값을 key로 설정
+        new_value = x.detach()  # 원하는 value (loss나 다른 출력값) 사용 가능
+        self.memory_slots.store(new_key, new_value)  # 메모리에 저장
 
         # crop out the language part of the output sequence
         if self.lang_fusion_type == 'seq':
